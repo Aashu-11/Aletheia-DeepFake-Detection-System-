@@ -12,9 +12,30 @@ import soundfile as sf
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 import joblib
-from finalpredicted import predict_deepfake_enhanced
+from finalpredicted import predict_deepfake, predict_deepfake_enhanced
 import pandas as pd
 import json
+
+
+def render_fake_real_donut(fake_count, real_count):
+    if fake_count + real_count == 0:
+        return
+    fig, ax = plt.subplots(figsize=(4, 4))
+    sizes = [fake_count, real_count]
+    labels = ["Fake", "Real"]
+    colors = ["#ef4444", "#22c55e"]
+    ax.pie(
+        sizes,
+        labels=labels,
+        colors=colors,
+        autopct="%1.1f%%",
+        startangle=90,
+        wedgeprops={"width": 0.45, "edgecolor": "white"},
+        textprops={"color": "#1f2937"},
+    )
+    ax.set_title("Frame Split")
+    st.pyplot(fig)
+    plt.close(fig)
 
 def _load_audio(source):
     if isinstance(source, (bytes, bytearray)):
@@ -123,21 +144,65 @@ def analyze_audio(example_file_path):
     
 def check_video_enhanced(uploaded_video_file, method, use_tta=True):
     """Enhanced video checking with TTA and frequency/texture analysis"""
-    with st.spinner("Analyzing video with enhanced detection..."):
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    try:
+        status_text.text("📤 Uploading video file...")
+        progress_bar.progress(10)
+        
         input_video_file_path = "uploaded_video.mp4"
         with open(input_video_file_path, "wb") as f:
             f.write(uploaded_video_file.getbuffer())
         
+        status_text.text("🔍 Extracting frames from video...")
+        progress_bar.progress(20)
+        
         # Use enhanced prediction with all features
-        fake_prob, real_prob, pred, details = predict_deepfake_enhanced(
-            input_video_file_path, 
-            method, 
+        status_text.text("🧠 Running deepfake detection model...")
+        progress_bar.progress(40)
+        
+        base_fake_prob, base_real_prob, base_pred = predict_deepfake(
+            input_video_file_path, method, debug=False, verbose=False
+        )
+        details = None
+        enhanced_result = predict_deepfake_enhanced(
+            input_video_file_path,
+            method,
             return_details=True,
             use_tta=use_tta,
-            verbose=False
+            verbose=False,
         )
+        if enhanced_result:
+            _, _, _, details = enhanced_result
         
-    return fake_prob, real_prob, pred, details
+        status_text.text("🌡️ Generating heatmap visualizations...")
+        progress_bar.progress(80)
+        
+        # Verify heatmaps were generated
+        if details and details.get("grad_cam_dir"):
+            grad_cam_dir = details.get("grad_cam_dir")
+            if os.path.exists(grad_cam_dir):
+                heatmap_files = glob.glob(os.path.join(grad_cam_dir, "*.png"))
+                if heatmap_files:
+                    status_text.text(f"✅ Generated {len(heatmap_files)} heatmap visualizations")
+                else:
+                    status_text.text("⚠️ Heatmap generation may have failed")
+        
+        progress_bar.progress(100)
+        status_text.text("✅ Analysis complete!")
+        
+    except Exception as e:
+        st.error(f"Error during analysis: {e}")
+        return None, None, None, None
+    finally:
+        # Clear progress indicators after a short delay
+        import time
+        time.sleep(0.5)
+        progress_bar.empty()
+        status_text.empty()
+        
+    return base_fake_prob, base_real_prob, base_pred, details
 
 
 def render_mel_spectrogram(mel_db):
@@ -174,6 +239,7 @@ def render_mfcc(mfcc):
 
 
 def render_frame_gallery(frames_dir, key_prefix, captions=None):
+    """Render a gallery of frames with optional captions"""
     if not frames_dir or not os.path.isdir(frames_dir):
         st.info("No extracted frames found to display.")
         return
@@ -195,7 +261,25 @@ def render_frame_gallery(frames_dir, key_prefix, captions=None):
         caption = name
         if captions and name in captions:
             caption = captions[name]
-        cols[i % 4].image(frame_path, caption=caption, use_column_width=True)
+        try:
+            cols[i % 4].image(frame_path, caption=caption, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error displaying {name}: {e}")
+
+
+def verify_and_display_heatmaps(grad_cam_dir, details):
+    """Verify heatmap directory and files exist, return status and file count"""
+    if not grad_cam_dir:
+        return False, 0, "Heatmap directory not specified"
+    
+    if not os.path.isdir(grad_cam_dir):
+        return False, 0, f"Heatmap directory does not exist: {grad_cam_dir}"
+    
+    heatmap_files = glob.glob(os.path.join(grad_cam_dir, "*.png"))
+    if not heatmap_files:
+        return False, 0, f"No PNG files found in {grad_cam_dir}"
+    
+    return True, len(heatmap_files), f"Found {len(heatmap_files)} heatmap files"
 
 
 def _select_frame_paths(frame_paths, max_frames):
@@ -439,22 +523,27 @@ def render_probability_timeline(probabilities):
 
 def main():
     st.set_page_config(page_title="Enhanced Deepfake Checker", page_icon="🔍", layout="wide")
-    
     st.title("🔍 Enhanced Deepfake Detection System")
-    st.markdown("""
-    This advanced system uses **multi-modal analysis** including:
-    - 🧠 Deep learning model predictions with Test-Time Augmentation
-    - 🌈 Enhanced Grad-CAM heatmap visualization (multi-layer)
-    - 📊 Frequency domain analysis (FFT patterns)
-    - 🧵 Texture pattern analysis (Local Binary Patterns)
-    - 🎯 Adaptive thresholding based on video characteristics
-    """)
-    
+    st.markdown(
+        """
+        This system uses multi-modal analysis including:
+        - Deep learning model predictions with Test-Time Augmentation
+        - Grad-CAM heatmap visualization
+        - Frequency domain analysis (FFT patterns)
+        - Texture pattern analysis (LBP)
+        - Adaptive thresholding based on video characteristics
+        """
+    )
+
     st.header("🎵 Audio Deepfake Detection")
     uploaded_audio_file = st.file_uploader("Upload Audio File", type=["wav"], key="audio_uploader")
     if uploaded_audio_file is not None:
         st.write("Uploaded audio file details:")
-        audio_file_details = {"FileName": uploaded_audio_file.name, "FileType": uploaded_audio_file.type, "FileSize": uploaded_audio_file.size}
+        audio_file_details = {
+            "FileName": uploaded_audio_file.name,
+            "FileType": uploaded_audio_file.type,
+            "FileSize": uploaded_audio_file.size,
+        }
         st.write(audio_file_details)
 
         if st.button("Check Audio"):
@@ -465,33 +554,39 @@ def main():
             else:
                 confidence = audio_report.get("confidence")
                 conf_text = "N/A" if confidence is None else f"{round(confidence * 100, 2)}%"
-                st.subheader("Audio Report")
-                c1, c2, c3 = st.columns(3)
+                st.subheader("Audio Summary")
+                c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Prediction", audio_report["label"].upper())
                 c2.metric("Confidence (%)", conf_text)
                 c3.metric("Duration (s)", f"{round(audio_report['duration'], 2)}")
+                noise_score = min(1.0, (audio_report["flatness"] * 2.5) + (audio_report["zcr"] * 3.0))
+                clarity = max(0.0, 1.0 - noise_score)
+                c4.metric("Signal Clarity", f"{clarity * 100:.0f}%")
 
-                st.write("Signal metrics")
-                st.write(
-                    {
-                        "sample_rate": audio_report["sample_rate"],
-                        "rms": round(audio_report["rms"], 6),
-                        "spectral_centroid": round(audio_report["spectral_centroid"], 2),
-                        "zero_crossing_rate": round(audio_report["zcr"], 6),
-                        "spectral_flatness": round(audio_report["flatness"], 6),
-                        "spectral_rolloff": round(audio_report["rolloff"], 2),
-                        "harmonic_percussive_ratio": round(audio_report["hpr"], 4),
-                    }
-                )
+                st.subheader("Signal Health Metrics")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Sample Rate", audio_report["sample_rate"])
+                m2.metric("RMS Energy", f"{audio_report['rms']:.6f}")
+                m3.metric("Spectral Centroid", f"{audio_report['spectral_centroid']:.2f}")
+                m4.metric("Zero Crossing Rate", f"{audio_report['zcr']:.6f}")
+
+                m5, m6, m7, m8 = st.columns(4)
+                m5.metric("Spectral Flatness", f"{audio_report['flatness']:.6f}")
+                m6.metric("Spectral Rolloff", f"{audio_report['rolloff']:.2f}")
+                m7.metric("H/P Ratio", f"{audio_report['hpr']:.4f}")
+                m8.metric("Indicators", f"{len(audio_report['indicators'])}")
+
+                st.subheader("Audio Visuals")
                 render_waveform(audio_report["audio"], audio_report["sample_rate"])
                 render_mel_spectrogram(audio_report["mel_db"])
                 render_mfcc(audio_report["mfcc"])
 
                 st.subheader("Audio Explainability")
                 if audio_report["indicators"]:
+                    st.info("Potential artifact signals detected:")
                     st.write(audio_report["indicators"])
                 else:
-                    st.write("No strong artifact indicators detected by heuristics.")
+                    st.success("No strong artifact indicators detected by heuristics.")
             
     st.markdown("---")
     st.header("🎬 Video Deepfake Detection")
@@ -522,6 +617,7 @@ def main():
                 if probability is not None:
                     probability = round(probability * 100, 4)
                 total_frames = len(details.get("probabilities", [])) if details else 0
+                probabilities = details.get("probabilities", []) if details else []
 
                 # Main result banner
                 st.markdown("---")
@@ -531,6 +627,32 @@ def main():
                     st.error(f"⚠️ The video is classified as **{label}** with {probability}% confidence")
 
                 if details:
+                    st.subheader("At a Glance")
+                    mean_prob = float(np.mean(probabilities)) if probabilities else None
+                    std_prob = float(np.std(probabilities)) if probabilities else None
+                    uncertainty = float(details.get("avg_uncertainty", 0.0))
+                    risk_index = None
+                    if mean_prob is not None:
+                        risk_index = min(1.0, max(0.0, (0.7 * mean_prob) + (0.3 * min(uncertainty, 1.0))))
+                    consistency = None if std_prob is None else max(0.0, 1.0 - min(std_prob * 2.0, 1.0))
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Outcome", label)
+                    c2.metric("Confidence", f"{probability}%")
+                    c3.metric("Frames", str(total_frames))
+                    if risk_index is None:
+                        c4.metric("Risk Index", "N/A")
+                    else:
+                        c4.metric("Risk Index", f"{risk_index * 100:.0f}%")
+
+                    if risk_index is not None:
+                        st.caption("Risk index blends average frame probability and uncertainty.")
+                        st.progress(risk_index)
+
+                    if consistency is not None:
+                        st.caption(f"Consistency score: {consistency * 100:.0f}% (higher is more stable).")
+                        st.progress(consistency)
+
                     # Enhanced metrics section
                     render_enhanced_analysis_metrics(details)
                     
@@ -547,11 +669,37 @@ def main():
                     st.markdown("---")
                     
                     # Timeline
-                    probabilities = details.get("probabilities", [])
                     if probabilities:
                         render_probability_timeline(probabilities)
+                        threshold = details.get("adaptive_threshold", 0.5)
+                        fake_frames = int(np.sum(np.array(probabilities) >= threshold))
+                        real_frames = int(np.sum(np.array(probabilities) < threshold))
+                        render_fake_real_donut(fake_frames, real_frames)
                     
                     st.markdown("---")
+                    st.subheader("Plain-English Signals")
+                    freq_analysis = details.get("freq_analysis", {})
+                    texture_analysis = details.get("texture_analysis", {})
+                    signals = []
+                    freq_balance = freq_analysis.get("avg_freq_balance")
+                    texture_uniformity = texture_analysis.get("avg_uniformity")
+                    if freq_balance is not None:
+                        if freq_balance > 1.5:
+                            signals.append("Strong frequency imbalance suggests synthetic artifacts.")
+                        elif freq_balance > 1.3:
+                            signals.append("Moderate frequency imbalance detected.")
+                        else:
+                            signals.append("Frequency balance looks natural.")
+                    if texture_uniformity is not None:
+                        if texture_uniformity < 0.08:
+                            signals.append("Texture uniformity is low, which can indicate GAN artifacts.")
+                        elif texture_uniformity < 0.12:
+                            signals.append("Texture uniformity is borderline.")
+                        else:
+                            signals.append("Texture patterns look consistent.")
+                    if not signals:
+                        signals.append("No strong anomalies detected in frequency or texture checks.")
+                    st.info(" ".join(signals))
                     
                     # Detailed tabs
                     st.subheader("📑 Detailed Analysis Tabs")
@@ -570,22 +718,112 @@ def main():
 
                     with tabs[0]:
                         st.markdown("### 🌡️ Enhanced Multi-Layer Grad-CAM Heatmaps")
-                        st.info("These heatmaps show which regions the model focuses on. Red areas indicate suspicious regions.")
+                        st.info("These heatmaps show which regions the model focuses on. **Red/yellow areas indicate suspicious regions** that the model considers most important for deepfake detection.")
                         
-                        if grad_cam_dir and os.path.isdir(grad_cam_dir):
-                            captions = {}
-                            for item in details.get("grad_cam_frames", []):
-                                prob_pct = round(item.get("prob", 0.0) * 100, 2)
-                                captions[item.get("file", "")] = f"{item.get('file', '')} | Fake: {prob_pct}%"
-                            render_frame_gallery(grad_cam_dir, "enhanced_grad_cam", captions=captions)
+                        # Verify heatmaps exist
+                        heatmap_exists, heatmap_count, status_msg = verify_and_display_heatmaps(grad_cam_dir, details)
+                        
+                        if heatmap_exists and heatmap_count > 0:
+                            heatmap_files = sorted(glob.glob(os.path.join(grad_cam_dir, "*.png")))
+                            st.success(f"✅ Found {len(heatmap_files)} heatmap visualizations")
                             
-                            st.markdown("**Heatmap Improvements:**")
-                            st.write("✓ Uses last 3 convolutional layers (vs 1 in old version)")
-                            st.write("✓ 15 smoothing samples (vs 8)")
-                            st.write("✓ Adaptive normalization with gamma correction")
-                            st.write("✓ Better color mapping for visualization")
+                            # Create captions with probabilities
+                            captions = {}
+                            grad_cam_frames = details.get("grad_cam_frames", [])
+                            for item in grad_cam_frames:
+                                filename = item.get("file", "")
+                                prob_pct = round(item.get("prob", 0.0) * 100, 2)
+                                captions[filename] = f"Fake: {prob_pct}%"
+                            
+                            # Display heatmaps in a gallery
+                            max_display = min(60, len(heatmap_files))
+                            default_display = min(20, len(heatmap_files))
+                            num_frames = st.slider(
+                                "Heatmaps to display", 1, max_display, default_display, 
+                                key="heatmap_frames_slider"
+                            )
+                            
+                            cols = st.columns(4)
+                            for i, heatmap_path in enumerate(heatmap_files[:num_frames]):
+                                filename = os.path.basename(heatmap_path)
+                                caption = captions.get(filename, filename)
+                                cols[i % 4].image(
+                                    heatmap_path, 
+                                    caption=caption, 
+                                    use_container_width=True
+                                )
+                            
+                            st.markdown("---")
+                            st.markdown("**🔬 Heatmap Technical Details:**")
+                            col_info1, col_info2 = st.columns(2)
+                            with col_info1:
+                                st.write("✓ **Multi-layer analysis**: Uses last 3 convolutional layers")
+                                st.write("✓ **Smoothing**: 15 samples per layer for stability")
+                                st.write("✓ **Noise reduction**: Gaussian blur applied")
+                            with col_info2:
+                                st.write("✓ **Normalization**: Adaptive percentile-based scaling")
+                                st.write("✓ **Gamma correction**: Enhanced visibility (γ=0.8)")
+                                st.write("✓ **Color mapping**: JET colormap for clear visualization")
+                            
+                            # Show interpretation guide
+                            with st.expander("📖 How to Interpret Heatmaps"):
+                                st.markdown("""
+                                **Color Guide:**
+                                - 🔴 **Red/Orange**: High attention - model strongly considers these regions
+                                - 🟡 **Yellow**: Moderate attention - potentially suspicious areas
+                                - 🟢 **Green/Blue**: Low attention - less important for detection
+                                
+                                **What to Look For:**
+                                - Concentrated red areas around face boundaries → Possible face-swap artifacts
+                                - Red regions in eyes/nose/mouth → Potential manipulation indicators
+                                - Uniform heat distribution → May indicate real video
+                                - Patchy or irregular patterns → Could suggest GAN-generated content
+                                """)
                         else:
-                            st.warning("Enhanced Grad-CAM outputs not found.")
+                            st.warning("⚠️ Heatmap visualizations not found or failed to generate.")
+                            
+                            # Show helpful information
+                            heatmap_count = details.get("heatmap_count", 0)
+                            if heatmap_count > 0:
+                                st.info(f"💡 {heatmap_count} heatmaps were generated but may not be accessible. Please check the directory.")
+                            else:
+                                st.info("💡 Heatmaps are generated for the top 30 frames with highest fake probability. If generation failed, check the console for errors.")
+                            
+                            # Show debug info if available
+                            if grad_cam_dir:
+                                with st.expander("🔍 Debug Information"):
+                                    st.code(f"Heatmap directory: {grad_cam_dir}")
+                                    st.code(f"Directory exists: {os.path.exists(grad_cam_dir) if grad_cam_dir else False}")
+                                    
+                                    if grad_cam_dir and os.path.exists(grad_cam_dir):
+                                        files_in_dir = os.listdir(grad_cam_dir)
+                                        st.write(f"**Files in directory:** {len(files_in_dir)}")
+                                        if files_in_dir:
+                                            st.write("**Sample files:**", files_in_dir[:10])
+                                        else:
+                                            st.write("**Directory is empty**")
+                                    
+                                    # Show expected vs actual
+                                    expected_count = len(details.get("grad_cam_frames", []))
+                                    st.write(f"**Expected heatmaps:** {expected_count}")
+                                    st.write(f"**Generated heatmaps:** {heatmap_count}")
+                            
+                            # Provide troubleshooting tips
+                            with st.expander("🛠️ Troubleshooting"):
+                                st.markdown("""
+                                **If heatmaps are not showing:**
+                                1. Check that the analysis completed successfully
+                                2. Verify you have write permissions in the output directory
+                                3. Ensure sufficient disk space is available
+                                4. Check console/logs for error messages
+                                5. Try refreshing the page after analysis completes
+                                6. Verify the model checkpoint file exists and is valid
+                                
+                                **Common issues:**
+                                - GPU memory errors → Try reducing batch size
+                                - File permission errors → Check directory permissions
+                                - Model loading errors → Verify checkpoint file exists
+                                """)
 
                     with tabs[1]:
                         st.markdown("### 📊 Frequency Domain Analysis (FFT Spectrum)")

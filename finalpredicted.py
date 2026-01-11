@@ -22,6 +22,117 @@ _visible_dep_warn = getattr(np, "VisibleDeprecationWarning", DeprecationWarning)
 warnings.filterwarnings("ignore", category=_visible_dep_warn)
 
 
+def predict_deepfake(input_videofile, df_method, debug=False, verbose=False):
+    num_workers = multiprocessing.cpu_count() - 2
+    model_params = dict()
+    model_params["batch_size"] = 32
+    model_params["imsize"] = 224
+    model_params["encoder_name"] = "tf_efficientnet_b0_ns"
+
+    prob_threshold_fake = 0.5
+    fake_fraction = 0.5
+
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    vid = os.path.basename(input_videofile)[:-4]
+    output_path = os.path.join("output", vid)
+    plain_faces_data_path = os.path.join(output_path, "plain_frames")
+    os.makedirs(output_path, exist_ok=True)
+    os.makedirs(plain_faces_data_path, exist_ok=True)
+
+    if verbose:
+        print("Extracting faces from the video")
+    extract_landmarks_from_video(input_videofile, output_path, overwrite=True)
+    crop_faces_from_video(input_videofile, output_path, plain_faces_data_path, overwrite=True)
+
+    if df_method == "plain_frames":
+        model_path = "final.chkpt"
+        frames_path = plain_faces_data_path
+    else:
+        raise Exception("Unknown method")
+
+    if verbose:
+        print(f"Detecting DeepFakes using method: {df_method}")
+    model = DeepFakeDetectModel(frame_dim=model_params["imsize"], encoder_name=model_params["encoder_name"])
+    if verbose:
+        print(f"Loading model weights {model_path}")
+    check_point_dict = torch.load(model_path, map_location=torch.device("cpu"))
+    model.load_state_dict(check_point_dict["model_state_dict"])
+
+    model = model.to(device)
+    model.eval()
+
+    test_transform = torchvision.transforms.Compose(
+        [
+            torchvision.transforms.Resize((model_params["imsize"], model_params["imsize"])),
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+    data_path = os.path.join(frames_path, vid)
+    test_dataset = SimpleImageFolder(root=data_path, transforms_=test_transform)
+    test_loader = DataLoader(
+        test_dataset, batch_size=model_params["batch_size"], num_workers=num_workers, pin_memory=True
+    )
+    if len(test_loader) == 0:
+        print("Cannot extract images. Dataloaders empty")
+        return None, None, None
+    probabilities = []
+    all_filenames = []
+    all_predicted_labels = []
+    with torch.no_grad():
+        for batch_id, samples in enumerate(test_loader):
+            frames = samples[0].to(device)
+            output = model(frames)
+            predicted = get_predictions(output).to("cpu").detach().numpy()
+            class_probability = get_probability(output).to("cpu").detach().numpy()
+            if len(predicted) > 1:
+                all_predicted_labels.extend(predicted.squeeze())
+                probabilities.extend(class_probability.squeeze())
+                all_filenames.extend(samples[1])
+            else:
+                all_predicted_labels.append(predicted.squeeze())
+                probabilities.append(class_probability.squeeze())
+                all_filenames.append(samples[1])
+
+        total_number_frames = len(probabilities)
+        probabilities = np.array(probabilities)
+
+        fake_frames_high_prob = probabilities[probabilities >= prob_threshold_fake]
+        number_fake_frames = len(fake_frames_high_prob)
+        if number_fake_frames == 0:
+            fake_prob = 0
+        else:
+            fake_prob = round(sum(fake_frames_high_prob) / number_fake_frames, 4)
+
+        real_frames_high_prob = probabilities[probabilities < prob_threshold_fake]
+        number_real_frames = len(real_frames_high_prob)
+        if number_real_frames == 0:
+            real_prob = 0
+        else:
+            real_prob = 1 - round(sum(real_frames_high_prob) / number_real_frames, 4)
+
+        pred = pred_strategy(
+            number_fake_frames, number_real_frames, total_number_frames, fake_fraction=fake_fraction
+        )
+
+        if debug:
+            print(f"all {probabilities}")
+            print(f"real {real_frames_high_prob}")
+            print(f"fake {fake_frames_high_prob}")
+            print(
+                "number_fake_frames={}, number_real_frames={}, total_number_frames={}, fake_fraction={}".format(
+                    number_fake_frames, number_real_frames, total_number_frames, fake_fraction
+                )
+            )
+            print(
+                f"fake_prob = {round(fake_prob * 100, 4)}%, real_prob = {round(real_prob * 100, 4)}%  pred={pred}"
+            )
+        return fake_prob, real_prob, pred
+
+
 def _select_sample_paths(paths, max_samples):
     if len(paths) <= max_samples:
         return paths
@@ -121,30 +232,106 @@ def _improved_grad_cam(model, input_tensor, smooth_samples=15, noise_sigma=0.08)
 
 def _save_enhanced_cam_overlay(image_path, cam, out_path, alpha=0.5):
     """Enhanced heatmap visualization with better contrast"""
-    image = cv2.imread(image_path)
-    if image is None:
-        return
-    
-    h, w = image.shape[:2]
-    cam_resized = cv2.resize(cam, (w, h))
-    
-    # Use adaptive normalization
-    low = np.percentile(cam_resized, 5)
-    high = np.percentile(cam_resized, 98)
-    cam_resized = (cam_resized - low) / (high - low + 1e-8)
-    cam_resized = np.clip(cam_resized, 0, 1)
-    
-    # Apply gamma correction for better visibility
-    gamma = 0.8
-    cam_resized = np.power(cam_resized, gamma)
-    
-    cam_resized = np.uint8(255 * cam_resized)
-    heatmap = cv2.applyColorMap(cam_resized, cv2.COLORMAP_JET)
-    
-    # Enhanced blending
-    overlay = cv2.addWeighted(image, 1 - alpha, heatmap, alpha, 0)
-    
-    cv2.imwrite(out_path, overlay)
+    try:
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"Warning: Could not read image from {image_path}")
+            return False
+        
+        # Ensure cam is 2D
+        if len(cam.shape) > 2:
+            cam = cam.mean(axis=0) if cam.shape[0] > 1 else cam[0]
+        
+        h, w = image.shape[:2]
+        cam_resized = cv2.resize(cam, (w, h), interpolation=cv2.INTER_LINEAR)
+        
+        # Use adaptive normalization
+        low = np.percentile(cam_resized, 5)
+        high = np.percentile(cam_resized, 98)
+        if high > low:
+            cam_resized = (cam_resized - low) / (high - low + 1e-8)
+        else:
+            cam_resized = np.zeros_like(cam_resized)
+        cam_resized = np.clip(cam_resized, 0, 1)
+        
+        # Apply gamma correction for better visibility
+        gamma = 0.8
+        cam_resized = np.power(cam_resized, gamma)
+        
+        cam_resized = np.uint8(255 * cam_resized)
+        heatmap = cv2.applyColorMap(cam_resized, cv2.COLORMAP_JET)
+        
+        # Enhanced blending
+        overlay = cv2.addWeighted(image, 1 - alpha, heatmap, alpha, 0)
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        
+        # Save the overlay
+        success = cv2.imwrite(out_path, overlay)
+        if not success:
+            print(f"Warning: Failed to save heatmap to {out_path}")
+            return False
+        
+        return True
+    except Exception as e:
+        print(f"Error saving heatmap overlay: {e}")
+        return False
+
+
+def _resolve_frame_path(frame_path, data_path):
+    if os.path.isabs(frame_path) and os.path.exists(frame_path):
+        return frame_path
+    candidate = os.path.join(data_path, frame_path)
+    if os.path.exists(candidate):
+        return candidate
+    candidate = os.path.join(data_path, os.path.basename(frame_path))
+    if os.path.exists(candidate):
+        return candidate
+    return frame_path
+
+
+def _simple_grad_cam(model, input_tensor):
+    model.eval()
+    conv_layers = _get_all_conv_layers(model.encoder)
+    if not conv_layers:
+        raise RuntimeError("No Conv2d layers found for Grad-CAM.")
+    target_layer = conv_layers[-1][1]
+    activations = []
+    gradients = []
+
+    def fwd_hook(_, __, out):
+        activations.append(out)
+
+    def bwd_hook(_, __, grad_out):
+        gradients.append(grad_out[0])
+
+    handle_fwd = target_layer.register_forward_hook(fwd_hook)
+    handle_bwd = target_layer.register_full_backward_hook(bwd_hook)
+
+    output = model(input_tensor.requires_grad_(True))
+    score = torch.sigmoid(output)[0, 0]
+    model.zero_grad()
+    score.backward()
+
+    handle_fwd.remove()
+    handle_bwd.remove()
+
+    if not activations or not gradients:
+        raise RuntimeError("Failed to compute Grad-CAM.")
+
+    act = activations[0]
+    grad = gradients[0]
+    grad = F.relu(grad)
+    weights = grad.mean(dim=(2, 3), keepdim=True)
+    cam = (weights * act).sum(dim=1)
+    cam = F.relu(cam)
+    cam = cam.squeeze(0)
+    cam_min = cam.min()
+    cam_max = cam.max()
+    if cam_max > cam_min:
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+    return cam.detach().cpu().numpy()
 
 
 def analyze_frequency_patterns(image_path):
@@ -417,27 +604,106 @@ def predict_deepfake_enhanced(input_videofile, df_method='plain_frames', debug=F
         # Generate improved heatmaps for top frames
         frame_info = list(zip(all_filenames, probabilities.tolist()))
         frame_info.sort(key=lambda x: x[1], reverse=True)
-        sample_info = frame_info[:30]  # Analyze more frames
+        num_heatmaps = min(30, len(frame_info))  # Generate up to 30 heatmaps
+        sample_info = frame_info[:num_heatmaps]
         
         if verbose:
-            print('Generating enhanced Grad-CAM visualizations...')
+            print(f'Generating enhanced Grad-CAM visualizations for {num_heatmaps} frames...')
+        
+        successful_heatmaps = 0
+        failed_heatmaps = 0
+        
+        # Ensure model is in eval mode for Grad-CAM
+        model.eval()
         
         with torch.enable_grad():
-            for image_path, prob in sample_info:
+            for idx, (image_path, prob) in enumerate(sample_info):
                 try:
-                    image = Image.open(image_path).convert("RGB")
+                    resolved_path = _resolve_frame_path(image_path, data_path)
+                    if not os.path.exists(resolved_path):
+                        if debug:
+                            print(f'Image file not found: {image_path}')
+                        failed_heatmaps += 1
+                        continue
+                    
+                    image = Image.open(resolved_path).convert("RGB")
                     input_tensor = test_transform(image).unsqueeze(0).to(device)
-                    cam = _improved_grad_cam(model, input_tensor, smooth_samples=15, 
-                                            noise_sigma=0.08)
-                    out_path = os.path.join(grad_cam_dir, os.path.basename(image_path))
-                    _save_enhanced_cam_overlay(image_path, cam, out_path, alpha=0.5)
+                    
+                    cam = None
+                    try:
+                        cam = _improved_grad_cam(model, input_tensor, smooth_samples=15, noise_sigma=0.08)
+                    except Exception as cam_err:
+                        if debug:
+                            print(f'Improved Grad-CAM failed for {resolved_path}: {cam_err}')
+                        try:
+                            cam = _simple_grad_cam(model, input_tensor)
+                        except Exception as simple_err:
+                            if debug:
+                                print(f'Simple Grad-CAM failed for {resolved_path}: {simple_err}')
+                            if device.type == "cuda":
+                                try:
+                                    torch.cuda.empty_cache()
+                                    cpu_model = model.to("cpu")
+                                    cpu_tensor = test_transform(image).unsqueeze(0).to("cpu")
+                                    cam = _simple_grad_cam(cpu_model, cpu_tensor)
+                                    model.to(device)
+                                except Exception as cpu_err:
+                                    if debug:
+                                        print(f'CPU Grad-CAM failed for {resolved_path}: {cpu_err}')
+                                    cam = None
+                                finally:
+                                    if device.type == "cuda":
+                                        model.to(device)
+                            else:
+                                cam = None
+                    if cam is None:
+                        failed_heatmaps += 1
+                        continue
+                    
+                    # Save heatmap overlay
+                    out_path = os.path.join(grad_cam_dir, os.path.basename(resolved_path))
+                    save_success = _save_enhanced_cam_overlay(resolved_path, cam, out_path, alpha=0.5)
+                    
+                    # Verify file was created
+                    if save_success and os.path.exists(out_path):
+                        # Double-check file is not empty
+                        if os.path.getsize(out_path) > 0:
+                            successful_heatmaps += 1
+                            if verbose and (idx + 1) % 5 == 0:
+                                print(f'  Generated {idx + 1}/{num_heatmaps} heatmaps...')
+                        else:
+                            if debug:
+                                print(f'Heatmap file is empty: {out_path}')
+                            failed_heatmaps += 1
+                    else:
+                        if debug:
+                            print(f'Failed to save heatmap: {out_path}')
+                        failed_heatmaps += 1
+                        
                 except Exception as e:
+                    failed_heatmaps += 1
                     if debug:
                         print(f'Failed to generate CAM for {image_path}: {e}')
+                    import traceback
+                    if debug:
+                        traceback.print_exc()
+        
+        if verbose:
+            print(f'Heatmap generation complete: {successful_heatmaps} successful, {failed_heatmaps} failed')
+            print(f'Heatmaps saved to: {grad_cam_dir}')
+        
+        # Verify at least some heatmaps were generated
+        if successful_heatmaps == 0:
+            if verbose:
+                print('WARNING: No heatmaps were successfully generated!')
 
+        # Ensure paths are absolute for proper access
+        abs_grad_cam_dir = os.path.abspath(grad_cam_dir) if grad_cam_dir else None
+        abs_frames_dir = os.path.abspath(data_path) if data_path else None
+        
         details = {
-            "frames_dir": data_path,
-            "grad_cam_dir": grad_cam_dir,
+            "frames_dir": abs_frames_dir,
+            "grad_cam_dir": abs_grad_cam_dir,
             "probabilities": probabilities.tolist(),
             "filenames": [os.path.basename(p) for p in all_filenames],
             "grad_cam_frames": [
@@ -447,6 +713,7 @@ def predict_deepfake_enhanced(input_videofile, df_method='plain_frames', debug=F
             "adaptive_threshold": float(prob_threshold_fake),
             "fake_fraction": float(fake_fraction),
             "avg_uncertainty": float(avg_uncertainty),
+            "heatmap_count": successful_heatmaps,  # Add count for verification
             "freq_analysis": {
                 "avg_freq_balance": float(np.mean([f['freq_balance'] for f in freq_features])) if freq_features else None,
                 "avg_high_freq": float(np.mean([f['high_freq_ratio'] for f in freq_features])) if freq_features else None,
