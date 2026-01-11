@@ -73,10 +73,10 @@ graph TB
     end
     
     subgraph "Detection Modules"
-        B -->|Image| C[Image Deepfake Detector<br/>BlazeFace + EfficientNet]
-        B -->|Text| D[Text Deepfake Detector<br/>Perplexity + ML Classifier]
-        B -->|Video| E[Video Deepfake Detector<br/>EfficientNet Frame Analysis]
-        B -->|Audio| F[Audio Deepfake Detector<br/>Spectrogram + CNN]
+        B --> C[Image Deepfake Detector<br/>BlazeFace + EfficientNet]
+        B --> D[Text Deepfake Detector<br/>Perplexity + ML Classifier]
+        B --> E[Video Deepfake Detector<br/>EfficientNet Frame Analysis]
+        B --> F[Audio Deepfake Detector<br/>Spectrogram + CNN]
     end
     
     subgraph "Output Layer"
@@ -552,10 +552,10 @@ graph TB
     end
     
     subgraph "Detection Modules"
-        B -->|Image| C[Image Detector]
-        B -->|Text| D[Text Detector]
-        B -->|Video| E[Video Detector]
-        B -->|Audio| F[Audio Detector]
+        B --> C[Image Detector]
+        B --> D[Text Detector]
+        B --> E[Video Detector]
+        B --> F[Audio Detector]
     end
     
     subgraph "Result Fusion"
