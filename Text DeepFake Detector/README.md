@@ -159,7 +159,7 @@ graph LR
         C4 --> C5[TF-IDF Transformer<br/>Term Frequency × Inverse DF]
         C5 --> C6[Weighted Feature Matrix]
         C6 --> C7[MultinomialNB<br/>Naive Bayes Classifier]
-        C7 --> C8[Probability Scores<br/>P AI | features]
+        C7 --> C8[Probability Scores<br/>P(AI given features)]
     end
     
     subgraph "Decision Fusion"

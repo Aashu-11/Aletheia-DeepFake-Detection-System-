@@ -367,7 +367,7 @@ graph LR
     subgraph "Spectrogram Generation"
         A1[Raw Audio<br/>16kHz, Mono] --> A2[Windowing<br/>25ms windows, 10ms hop]
         A2 --> A3[FFT<br/>512 or 1024 points]
-        A3 --> A4[Power Spectrum<br/>|FFT|²]
+        A3 --> A4[Power Spectrum<br/>abs(FFT)^2]
         A4 --> A5[Mel Filter Bank<br/>80 mel bins]
         A5 --> A6[Log Mel Spectrogram<br/>80×T matrix]
     end
