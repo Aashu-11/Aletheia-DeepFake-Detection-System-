@@ -1,0 +1,6 @@
+
+torch
+torchvision
+typing-extensions
+urllib3
+Werkzeug
