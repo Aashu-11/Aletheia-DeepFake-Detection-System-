@@ -17,4 +17,4 @@ tensorflow
 facenet-pytorch
 moviepy
 opencv-python-headless
-skimage
+scikit-image
