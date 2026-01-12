@@ -7,7 +7,7 @@ torch
 PyYAML
 pandas
 torchvision
-pillow
+pillow==10.4.0
 tqdm
 matplotlib
 seaborn
